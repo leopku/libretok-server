@@ -1,0 +1,375 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strconv"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/dto"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/repository"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/internal/sqlc"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/apperror"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/cache"
+	"github.com/chuanghiduoc/fiber-golang-boilerplate/pkg/database"
+)
+
+const (
+	bcryptCost         = 12
+	maxLoginAttempts   = 5
+	lockoutDuration    = 15 * time.Minute
+	loginAttemptPrefix = "login_attempts:"
+)
+
+type UserService interface {
+	Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error)
+	Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error)
+	FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error)
+	GetByID(ctx context.Context, id int64) (*dto.UserResponse, error)
+	List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error)
+	Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error)
+	Delete(ctx context.Context, id int64) error
+	ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error
+}
+
+type userService struct {
+	repo                     repository.UserRepository
+	refreshTokenRepo         repository.RefreshTokenRepository
+	requireEmailVerification bool
+	cache                    cache.Cache
+	txManager                *database.TxManager
+}
+
+func NewUserService(
+	repo repository.UserRepository,
+	refreshTokenRepo repository.RefreshTokenRepository,
+	requireEmailVerification bool,
+	appCache cache.Cache,
+	txManager *database.TxManager,
+) UserService {
+	return &userService{
+		repo:                     repo,
+		refreshTokenRepo:         refreshTokenRepo,
+		requireEmailVerification: requireEmailVerification,
+		cache:                    appCache,
+		txManager:                txManager,
+	}
+}
+
+func (s *userService) Register(ctx context.Context, req dto.RegisterRequest) (*dto.UserResponse, error) {
+	existing, err := s.repo.GetByEmail(ctx, req.Email)
+	if err != nil && !errors.Is(err, apperror.ErrNotFound) {
+		return nil, apperror.NewInternal("failed to check existing user")
+	}
+	if existing != nil {
+		return nil, apperror.NewBadRequest("email already registered")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcryptCost)
+	if err != nil {
+		return nil, apperror.NewInternal("failed to hash password")
+	}
+
+	user, err := s.repo.Create(ctx, sqlc.CreateUserParams{
+		Email:        req.Email,
+		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
+		Name:         req.Name,
+	})
+	if err != nil {
+		return nil, apperror.NewInternal("failed to create user")
+	}
+
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) Authenticate(ctx context.Context, req dto.LoginRequest) (*dto.UserResponse, error) {
+	// Check lockout (fail-closed: deny login if cache is unavailable)
+	cacheKey := loginAttemptPrefix + req.Email
+	locked, cacheErr := s.checkLoginLockout(ctx, cacheKey)
+	if cacheErr != nil {
+		return nil, apperror.NewInternal("unable to verify login attempts, please try again later")
+	}
+	if locked {
+		return nil, apperror.NewBadRequest(fmt.Sprintf("account temporarily locked, try again in %d minutes", int(lockoutDuration.Minutes())))
+	}
+
+	user, err := s.repo.GetByEmail(ctx, req.Email)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			s.incrementLoginAttempts(ctx, cacheKey)
+			return nil, apperror.NewUnauthorized("invalid email or password")
+		}
+		return nil, apperror.NewInternal("failed to get user")
+	}
+
+	if !user.PasswordHash.Valid {
+		s.incrementLoginAttempts(ctx, cacheKey)
+		return nil, apperror.NewUnauthorized("invalid email or password")
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.Password)); err != nil {
+		s.incrementLoginAttempts(ctx, cacheKey)
+		return nil, apperror.NewUnauthorized("invalid email or password")
+	}
+
+	if s.requireEmailVerification && !user.EmailVerifiedAt.Valid {
+		return nil, apperror.NewForbidden("email not verified")
+	}
+
+	// Clear attempts on success
+	if err := s.cache.Delete(ctx, cacheKey); err != nil {
+		slog.Warn("cache error clearing login attempts", slog.String("key", cacheKey), slog.Any("error", err))
+	}
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) incrementLoginAttempts(ctx context.Context, key string) {
+	// Atomic increment so parallel failed logins cannot race the counter and
+	// slip past the lockout threshold.
+	if _, err := s.cache.Increment(ctx, key, lockoutDuration); err != nil {
+		slog.Error("cache error storing login attempts — brute force protection degraded", slog.String("key", key), slog.Any("error", err))
+	}
+}
+
+// checkLoginLockout verifies that the account is not locked out.
+// Returns an error if the cache read fails (fail-closed to protect against brute force when cache is down).
+func (s *userService) checkLoginLockout(ctx context.Context, cacheKey string) (bool, error) {
+	data, cacheErr := s.cache.Get(ctx, cacheKey)
+	if cacheErr != nil {
+		slog.Error("cache unavailable for login lockout check — denying request for safety", slog.String("key", cacheKey), slog.Any("error", cacheErr))
+		return false, cacheErr
+	}
+	if data != nil {
+		attempts, _ := strconv.Atoi(string(data))
+		if attempts >= maxLoginAttempts {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *userService) FindOrCreateByGoogle(ctx context.Context, googleID, email, name string) (*dto.UserResponse, error) {
+	user, err := s.findOrCreateByGoogleUser(ctx, googleID, email, name)
+	if err != nil {
+		return nil, err
+	}
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) findOrCreateByGoogleUser(ctx context.Context, googleID, email, name string) (*sqlc.User, error) {
+	findOrCreate := func(repo repository.UserRepository) (*sqlc.User, error) {
+		user, err := repo.GetByGoogleID(ctx, googleID)
+		if err == nil {
+			return user, nil
+		}
+		if !errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewInternal("failed to find user by google id")
+		}
+
+		existing, err := repo.GetByEmail(ctx, email)
+		if err == nil {
+			linked, linkErr := repo.LinkGoogleAccount(ctx, sqlc.LinkGoogleAccountParams{
+				GoogleID: pgtype.Text{String: googleID, Valid: true},
+				ID:       existing.ID,
+			})
+			if linkErr != nil {
+				return nil, apperror.NewInternal("failed to link google account")
+			}
+			return linked, nil
+		}
+		if !errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewInternal("failed to find user by email")
+		}
+
+		newUser, err := repo.CreateOAuthUser(ctx, sqlc.CreateOAuthUserParams{
+			Email:        email,
+			Name:         name,
+			GoogleID:     pgtype.Text{String: googleID, Valid: true},
+			AuthProvider: "google",
+		})
+		if err != nil {
+			return nil, err
+		}
+		return newUser, nil
+	}
+
+	if s.txManager != nil {
+		var result *sqlc.User
+		txErr := s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			txUserRepo := repository.NewUserRepository(tx)
+			var err error
+			result, err = findOrCreate(txUserRepo)
+			return err
+		})
+		if txErr != nil {
+			if repository.IsUniqueViolation(txErr) {
+				if user, err := s.repo.GetByGoogleID(ctx, googleID); err == nil {
+					return user, nil
+				}
+			}
+			return nil, apperror.NewInternal("failed to create oauth user")
+		}
+		return result, nil
+	}
+
+	result, err := findOrCreate(s.repo)
+	if err != nil {
+		if repository.IsUniqueViolation(err) {
+			if user, retryErr := s.repo.GetByGoogleID(ctx, googleID); retryErr == nil {
+				return user, nil
+			}
+		}
+		return nil, apperror.NewInternal("failed to create oauth user")
+	}
+	return result, nil
+}
+
+func (s *userService) GetByID(ctx context.Context, id int64) (*dto.UserResponse, error) {
+	user, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("user not found")
+		}
+		return nil, apperror.NewInternal("failed to get user")
+	}
+
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) List(ctx context.Context, limit int, startingAfter string) ([]dto.UserResponse, bool, error) {
+	cur, pageSize, err := buildCursor(limit, startingAfter)
+	if err != nil {
+		return nil, false, err
+	}
+
+	users, err := s.repo.ListCursor(ctx, cur)
+	if err != nil {
+		return nil, false, apperror.NewInternal("failed to list users")
+	}
+
+	hasMore := len(users) > pageSize
+	if hasMore {
+		users = users[:pageSize]
+	}
+
+	responses := make([]dto.UserResponse, len(users))
+	for i := range users {
+		responses[i] = *ToUserResponse(&users[i])
+	}
+
+	return responses, hasMore, nil
+}
+
+func (s *userService) Update(ctx context.Context, id int64, req dto.UpdateUserRequest) (*dto.UserResponse, error) {
+	existing, err := s.repo.GetByID(ctx, id)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewNotFound("user not found")
+		}
+		return nil, apperror.NewInternal("failed to get user")
+	}
+
+	name := existing.Name
+	email := existing.Email
+
+	if req.Name != nil {
+		name = *req.Name
+	}
+	if req.Email != nil && *req.Email != existing.Email {
+		dup, err := s.repo.GetByEmail(ctx, *req.Email)
+		if err != nil && !errors.Is(err, apperror.ErrNotFound) {
+			return nil, apperror.NewInternal("failed to check email availability")
+		}
+		if dup != nil {
+			return nil, apperror.NewBadRequest("email already in use")
+		}
+		email = *req.Email
+	}
+
+	user, err := s.repo.Update(ctx, sqlc.UpdateUserParams{
+		ID:    id,
+		Name:  name,
+		Email: email,
+	})
+	if err != nil {
+		return nil, apperror.NewInternal("failed to update user")
+	}
+
+	return ToUserResponse(user), nil
+}
+
+func (s *userService) Delete(ctx context.Context, id int64) error {
+	doDelete := func(userRepo repository.UserRepository, refreshRepo repository.RefreshTokenRepository) error {
+		_, err := userRepo.Delete(ctx, id)
+		if err != nil {
+			if errors.Is(err, apperror.ErrNotFound) {
+				return apperror.NewNotFound("user not found")
+			}
+			return apperror.NewInternal("failed to delete user")
+		}
+		// Revoke all refresh tokens so a deleted user's sessions cannot outlive
+		// the account. Failing here rolls back the delete when run in a tx.
+		if err := refreshRepo.DeleteByUserID(ctx, id); err != nil {
+			return apperror.NewInternal("failed to revoke refresh tokens")
+		}
+		return nil
+	}
+
+	if s.txManager != nil {
+		return s.txManager.WithTx(ctx, func(tx pgx.Tx) error {
+			return doDelete(repository.NewUserRepository(tx), repository.NewRefreshTokenRepository(tx))
+		})
+	}
+
+	return doDelete(s.repo, s.refreshTokenRepo)
+}
+
+func (s *userService) ChangePassword(ctx context.Context, userID int64, req dto.ChangePasswordRequest) error {
+	user, err := s.repo.GetByID(ctx, userID)
+	if err != nil {
+		if errors.Is(err, apperror.ErrNotFound) {
+			return apperror.NewNotFound("user not found")
+		}
+		return apperror.NewInternal("failed to get user")
+	}
+
+	if !user.PasswordHash.Valid {
+		return apperror.NewBadRequest("cannot change password for OAuth accounts")
+	}
+
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash.String), []byte(req.CurrentPassword)); err != nil {
+		return apperror.NewBadRequest("current password is incorrect")
+	}
+
+	hash, err := bcrypt.GenerateFromPassword([]byte(req.NewPassword), bcryptCost)
+	if err != nil {
+		return apperror.NewInternal("failed to hash password")
+	}
+
+	_, err = s.repo.UpdatePassword(ctx, sqlc.UpdateUserPasswordParams{
+		PasswordHash: pgtype.Text{String: string(hash), Valid: true},
+		ID:           userID,
+	})
+	if err != nil {
+		return apperror.NewInternal("failed to update password")
+	}
+
+	return nil
+}
+
+func ToUserResponse(user *sqlc.User) *dto.UserResponse {
+	return &dto.UserResponse{
+		ID:            user.ID,
+		Email:         user.Email,
+		Name:          user.Name,
+		Role:          user.Role,
+		EmailVerified: user.EmailVerifiedAt.Valid,
+		CreatedAt:     user.CreatedAt.Time,
+		UpdatedAt:     user.UpdatedAt.Time,
+	}
+}
